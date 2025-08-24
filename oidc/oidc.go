@@ -3,13 +3,16 @@ package oidc
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/zitadel/oidc/v3/pkg/client/rp"
 	cookie "github.com/zitadel/oidc/v3/pkg/http"
 )
@@ -47,6 +50,11 @@ type OIDCClient struct {
 	loginURL    string
 	callbackURL string
 	logoutURL   string
+}
+
+type OIDCState struct {
+	Token    string `json:"token"`
+	Redirect string `json:"redirect"`
 }
 
 func (c OIDCConfig) NewClient() (*OIDCClient, error) {
@@ -147,4 +155,27 @@ func (c OIDCConfig) NewClient() (*OIDCClient, error) {
 	}
 
 	return &oidcClient, nil
+}
+
+func (c OIDCClient) NewLoginHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parameter := r.URL.Query().Get("redirect")
+		redirect, err := url.Parse(parameter)
+		if err != nil || !filepath.IsAbs(redirect.Path) {
+			redirect, _ = url.Parse(c.baseURL)
+		}
+
+		stateMap := OIDCState{
+			Token:    uuid.New().String(),
+			Redirect: redirect.Path,
+		}
+
+		state := func() string {
+			stateJson, _ := json.Marshal(stateMap)
+			return string(stateJson)
+		}
+
+		handler := rp.AuthURLHandler(state, c.client)
+		handler(w, r)
+	})
 }
