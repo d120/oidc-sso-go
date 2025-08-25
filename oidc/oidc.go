@@ -223,6 +223,8 @@ func (c OIDCClient) NewCallbackHandler() http.Handler {
 			GivenName:  info.GivenName,
 			FamilyName: info.FamilyName,
 			Nickname:   info.Nickname,
+
+			IDTokenRaw: tokens.IDToken,
 		}
 
 		if claims.Subject == "" {
@@ -239,6 +241,9 @@ func (c OIDCClient) NewCallbackHandler() http.Handler {
 			return
 		} else if claims.Email == "" || !claims.EmailVerified {
 			http.Error(w, "email claim or email-verified claim is missing in user-info token", http.StatusInternalServerError)
+			return
+		} else if claims.IDTokenRaw == "" {
+			http.Error(w, "ID token for logout is missing", http.StatusInternalServerError)
 			return
 		}
 
