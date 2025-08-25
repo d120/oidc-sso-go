@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"path/filepath"
 	"slices"
 	"time"
@@ -58,6 +59,18 @@ type OIDCState struct {
 	Token    string `json:"token"`
 	Redirect string `json:"redirect"`
 }
+
+type UnauthorizedAction int
+
+const (
+	RedirectAuth UnauthorizedAction = iota
+	RespondNotFound
+	RespondUnauthorized
+)
+
+type AuthzPredicate func(*http.Request, *UserSessionClaims) bool
+
+type Protector func(http.Handler) http.Handler
 
 func (c OIDCConfig) NewClient() (*OIDCClient, error) {
 	if _, err := url.Parse(c.URL); err != nil {
@@ -265,9 +278,9 @@ func (c OIDCClient) NewCallbackHandler() http.Handler {
 		http.SetCookie(w, &cookie)
 
 		// state parameter passed to callback by CodeExchangeHandler and UserinfoCallback is already validated (not modified and matches with HTTP URL parameter)
-		var stateMap *OIDCState
+		var stateMap OIDCState
 		var redirect string
-		err = json.Unmarshal([]byte(state), stateMap)
+		err = json.Unmarshal([]byte(state), &stateMap)
 		if err != nil || stateMap.Redirect == "" {
 			redirect = baseURL.Path
 		} else {
@@ -313,4 +326,87 @@ func (c OIDCClient) NewLogoutHandler() http.Handler {
 
 		http.Redirect(w, r, redirect.String(), http.StatusFound)
 	})
+}
+
+func (c OIDCClient) Protector(unauthorizedAction UnauthorizedAction, errorHandlers map[int]http.Handler, authzPredicate AuthzPredicate) Protector {
+	return func(handler http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var tokenString string
+			sessionCookie, err := r.Cookie(c.client.OAuthConfig().ClientID + "-session")
+			switch {
+			case errors.Is(err, http.ErrNoCookie):
+				tokenString = ""
+			case err != nil:
+				http.Error(w, "internal server error occured when reading session cookie", http.StatusInternalServerError)
+				return
+			default:
+				tokenString = sessionCookie.Value
+			}
+
+			/*
+			 * ValidateUserToken(...) returns nil for userSessionClaims in four different cases:
+			 *   1. no session cookie exists: user is unauthenticated
+			 *   2. token is expired: user can be considered as unauthenticated
+			 *   3. token has no expiration: user would have an infinite session; do not accept and thus consider user unauthenticated
+			 *   4. token is invalid (due to invalid signature or invalid structure): user can be considered as unauthenticated
+			 * In any case of a nil value returned by ValidateUserToken(...) for userSessionClaims the user can be considered as unauthenticated.
+			 *
+			 * If ValidateUserToken(...) does not return a nil value for userSessionClaims, the user has a valid session.
+			 */
+			userSessionClaims, _ := ValidateUserToken(tokenString, c.secret)
+
+			if authzPredicate(r, userSessionClaims) {
+				handler.ServeHTTP(w, r)
+				return
+			}
+
+			switch unauthorizedAction {
+			case RespondNotFound:
+				errorHandlers[http.StatusNotFound].ServeHTTP(w, r)
+				return
+			case RespondUnauthorized:
+				errorHandlers[http.StatusUnauthorized].ServeHTTP(w, r)
+				return
+			default:
+				var redirectPath string
+				if path.IsAbs(r.URL.Path) {
+					redirectPath = r.URL.Path
+				} else {
+					redirectPath = "/"
+				}
+				loginURL, _ := url.Parse(c.loginURL)
+				query := loginURL.Query()
+				query.Set("redirect", redirectPath)
+				loginURL.RawQuery = query.Encode()
+				http.Redirect(w, r, loginURL.String(), http.StatusFound)
+				return
+			}
+		})
+	}
+}
+
+func (c OIDCClient) ProtectHandler(unauthorizedAction UnauthorizedAction, errorHandlers map[int]http.Handler, authzPredicate AuthzPredicate, handler http.Handler) http.Handler {
+	return c.Protector(unauthorizedAction, errorHandlers, authzPredicate)(handler)
+}
+
+func IsAuthenticated(_ *http.Request, userSessionClaims *UserSessionClaims) bool {
+	return userSessionClaims != nil
+}
+
+func PredicateAll(l, r AuthzPredicate) AuthzPredicate {
+	return func(request *http.Request, userSessionClaims *UserSessionClaims) bool {
+		return l(request, userSessionClaims) && r(request, userSessionClaims)
+	}
+}
+
+func PredicateAny(l, r AuthzPredicate) AuthzPredicate {
+	return func(request *http.Request, userSessionClaims *UserSessionClaims) bool {
+		return l(request, userSessionClaims) || r(request, userSessionClaims)
+	}
+}
+
+func PredicateNot(p AuthzPredicate) AuthzPredicate {
+	return func(request *http.Request, userSessionClaims *UserSessionClaims) bool {
+		return !p(request, userSessionClaims)
+	}
 }
