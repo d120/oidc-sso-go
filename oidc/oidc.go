@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"path/filepath"
 	"slices"
 	"time"
@@ -58,6 +59,20 @@ type OIDCState struct {
 	Token    string `json:"token"`
 	Redirect string `json:"redirect"`
 }
+
+type AuthzFailureAction int
+
+const (
+	RedirectToAuth AuthzFailureAction = iota
+	RespondNotFound
+	RespondUnauthorized
+	RespondForbidden
+	RespondUnauthorizedForbidden
+)
+
+type AuthzPredicate func(*http.Request, *UserSessionClaims) bool
+
+type Protector func(http.Handler) http.Handler
 
 func (c OIDCConfig) NewClient() (*OIDCClient, error) {
 	if _, err := url.Parse(c.URL); err != nil {
@@ -265,9 +280,9 @@ func (c OIDCClient) NewCallbackHandler() http.Handler {
 		http.SetCookie(w, &cookie)
 
 		// state parameter passed to callback by CodeExchangeHandler and UserinfoCallback is already validated (not modified and matches with HTTP URL parameter)
-		var stateMap *OIDCState
+		var stateMap OIDCState
 		var redirect string
-		err = json.Unmarshal([]byte(state), stateMap)
+		err = json.Unmarshal([]byte(state), &stateMap)
 		if err != nil || stateMap.Redirect == "" {
 			redirect = baseURL.Path
 		} else {
@@ -313,4 +328,126 @@ func (c OIDCClient) NewLogoutHandler() http.Handler {
 
 		http.Redirect(w, r, redirect.String(), http.StatusFound)
 	})
+}
+
+func (c OIDCClient) Protector(authzFailureAction AuthzFailureAction, errorHandlers map[int]http.Handler, authzPredicate AuthzPredicate) Protector {
+	notFoundHandler, ok := errorHandlers[http.StatusNotFound]
+	if !ok {
+		notFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "requested page was not found", http.StatusNotFound)
+		})
+	}
+
+	unauthorizedHandler, ok := errorHandlers[http.StatusUnauthorized]
+	if !ok {
+		unauthorizedHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "requested page requires authentication", http.StatusUnauthorized)
+		})
+	}
+
+	forbiddenHandler, ok := errorHandlers[http.StatusForbidden]
+	if !ok {
+		forbiddenHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "permissions are not sufficient to request the page", http.StatusForbidden)
+		})
+	}
+
+	return func(handler http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var tokenString string
+			sessionCookie, err := r.Cookie(c.client.OAuthConfig().ClientID + "-session")
+			switch {
+			case errors.Is(err, http.ErrNoCookie):
+				tokenString = ""
+			case err != nil:
+				http.Error(w, "internal server error occured when reading session cookie", http.StatusInternalServerError)
+				return
+			default:
+				tokenString = sessionCookie.Value
+			}
+
+			/*
+			 * ValidateUserToken(...) returns nil for userSessionClaims in four different cases:
+			 *   1. no session cookie exists: user is unauthenticated
+			 *   2. token is expired: user can be considered as unauthenticated
+			 *   3. token has no expiration: user would have an infinite session; do not accept and thus consider user unauthenticated
+			 *   4. token is invalid (due to invalid signature or invalid structure): user can be considered as unauthenticated
+			 * In any case of a nil value returned by ValidateUserToken(...) for userSessionClaims the user can be considered as unauthenticated.
+			 *
+			 * If ValidateUserToken(...) does not return a nil value for userSessionClaims, the user has a valid session.
+			 */
+			userSessionClaims, _ := ValidateUserToken(tokenString, c.secret)
+
+			if authzPredicate(r, userSessionClaims) {
+				handler.ServeHTTP(w, r)
+				return
+			}
+
+			switch authzFailureAction {
+			case RespondNotFound:
+				notFoundHandler.ServeHTTP(w, r)
+				return
+			case RespondUnauthorized:
+				unauthorizedHandler.ServeHTTP(w, r)
+				return
+			case RespondForbidden:
+				forbiddenHandler.ServeHTTP(w, r)
+				return
+			case RespondUnauthorizedForbidden:
+				if userSessionClaims == nil {
+					// user has no (valid) session
+					unauthorizedHandler.ServeHTTP(w, r)
+				} else {
+					// user has a valid session but lacks permissions
+					forbiddenHandler.ServeHTTP(w, r)
+				}
+				return
+			default:
+				if userSessionClaims == nil {
+					// user has no (valid) session
+					var redirectPath string
+					if path.IsAbs(r.URL.Path) {
+						redirectPath = r.URL.Path
+					} else {
+						redirectPath = "/"
+					}
+					loginURL, _ := url.Parse(c.loginURL)
+					query := loginURL.Query()
+					query.Set("redirect", redirectPath)
+					loginURL.RawQuery = query.Encode()
+					http.Redirect(w, r, loginURL.String(), http.StatusFound)
+				} else {
+					// user has a valid session but lacks permissions
+					forbiddenHandler.ServeHTTP(w, r)
+				}
+				return
+			}
+		})
+	}
+}
+
+func (c OIDCClient) ProtectHandler(authzFailureAction AuthzFailureAction, errorHandlers map[int]http.Handler, authzPredicate AuthzPredicate, handler http.Handler) http.Handler {
+	return c.Protector(authzFailureAction, errorHandlers, authzPredicate)(handler)
+}
+
+func IsAuthenticated(_ *http.Request, userSessionClaims *UserSessionClaims) bool {
+	return userSessionClaims != nil
+}
+
+func PredicateAll(l, r AuthzPredicate) AuthzPredicate {
+	return func(request *http.Request, userSessionClaims *UserSessionClaims) bool {
+		return l(request, userSessionClaims) && r(request, userSessionClaims)
+	}
+}
+
+func PredicateAny(l, r AuthzPredicate) AuthzPredicate {
+	return func(request *http.Request, userSessionClaims *UserSessionClaims) bool {
+		return l(request, userSessionClaims) || r(request, userSessionClaims)
+	}
+}
+
+func PredicateNot(p AuthzPredicate) AuthzPredicate {
+	return func(request *http.Request, userSessionClaims *UserSessionClaims) bool {
+		return !p(request, userSessionClaims)
+	}
 }
