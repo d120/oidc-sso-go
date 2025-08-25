@@ -3,6 +3,7 @@ module github.com/d120/oidc-sso-go
 go 1.24.5
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0
 	github.com/zitadel/oidc/v3 v3.44.0
 )
