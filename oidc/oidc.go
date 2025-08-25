@@ -12,9 +12,11 @@ import (
 	"slices"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/zitadel/oidc/v3/pkg/client/rp"
 	cookie "github.com/zitadel/oidc/v3/pkg/http"
+	oidclib "github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 type OIDCConfig struct {
@@ -178,4 +180,97 @@ func (c OIDCClient) NewLoginHandler() http.Handler {
 		handler := rp.AuthURLHandler(state, c.client)
 		handler(w, r)
 	})
+}
+
+func (c OIDCClient) NewCallbackHandler() http.Handler {
+	baseURL, _ := url.Parse(c.baseURL)
+
+	callback := func(w http.ResponseWriter, r *http.Request, tokens *oidclib.Tokens[*oidclib.IDTokenClaims], state string, rp rp.RelyingParty, info *oidclib.UserInfo) {
+		var groups []string
+		if groupsAny, ok := info.Claims["groups"]; ok {
+			if groupsCast, ok := groupsAny.([]string); ok {
+				groups = groupsCast
+			} else {
+				groups = []string{}
+			}
+		}
+		var roles []string
+		if rolesAny, ok := info.Claims["roles"]; ok {
+			if rolesCast, ok := rolesAny.([]string); ok {
+				roles = rolesCast
+			} else {
+				roles = []string{}
+			}
+		}
+
+		expires := time.Now().Add(c.sessionLength)
+		claims := UserSessionClaims{
+			RegisteredClaims: jwt.RegisteredClaims{
+				Issuer:    c.baseURL,
+				Subject:   tokens.IDTokenClaims.Subject,
+				ExpiresAt: jwt.NewNumericDate(expires),
+				IssuedAt:  jwt.NewNumericDate(time.Now()),
+			},
+			SessionID: tokens.IDTokenClaims.SessionID,
+
+			Username:      info.PreferredUsername,
+			Email:         info.Email,
+			EmailVerified: bool(info.EmailVerified),
+
+			Groups: groups,
+			Roles:  roles,
+
+			GivenName:  info.GivenName,
+			FamilyName: info.FamilyName,
+			Nickname:   info.Nickname,
+		}
+
+		if claims.Subject == "" {
+			http.Error(w, "subject claim is missing in ID token", http.StatusInternalServerError)
+			return
+		} else if claims.ExpiresAt == nil {
+			http.Error(w, "expires-at claim is calculated incorrectly", http.StatusInternalServerError)
+			return
+		} else if claims.SessionID == "" {
+			http.Error(w, "session-id claim is missing in ID token", http.StatusInternalServerError)
+			return
+		} else if claims.Username == "" {
+			http.Error(w, "username claim is missing in user-info token", http.StatusInternalServerError)
+			return
+		} else if claims.Email == "" || !claims.EmailVerified {
+			http.Error(w, "email claim or email-verified claim is missing in user-info token", http.StatusInternalServerError)
+			return
+		}
+
+		tokenString, err := NewUserToken(&claims, c.secret)
+		if err != nil {
+			http.Error(w, "creating JWT session token failed", http.StatusInternalServerError)
+			return
+		}
+		cookie := http.Cookie{
+			Name:     c.client.OAuthConfig().ClientID + "-session",
+			Value:    tokenString,
+			Path:     baseURL.Path,
+			Domain:   baseURL.Hostname(),
+			Expires:  expires,
+			Secure:   true,
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		}
+		http.SetCookie(w, &cookie)
+
+		// state parameter passed to callback by CodeExchangeHandler and UserinfoCallback is already validated (not modified and matches with HTTP URL parameter)
+		var stateMap *OIDCState
+		var redirect string
+		err = json.Unmarshal([]byte(state), stateMap)
+		if err != nil || stateMap.Redirect == "" {
+			redirect = baseURL.Path
+		} else {
+			redirect = stateMap.Redirect
+		}
+
+		http.Redirect(w, r, redirect, http.StatusFound)
+	}
+
+	return rp.CodeExchangeHandler(rp.UserinfoCallback(callback), c.client)
 }
