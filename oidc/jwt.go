@@ -21,6 +21,8 @@ type UserSessionClaims struct {
 	GivenName  string `json:"given_name"`
 	FamilyName string `json:"family_name"`
 	Nickname   string `json:"nickname"`
+
+	IDTokenRaw string `json:"id_token_raw"`
 }
 
 func NewUserToken(userSessionClaims *UserSessionClaims, secret []byte) (string, error) {
