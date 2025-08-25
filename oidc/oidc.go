@@ -283,3 +283,38 @@ func (c OIDCClient) NewCallbackHandler() http.Handler {
 
 	return rp.CodeExchangeHandler(rp.UserinfoCallback(callback), c.client)
 }
+
+func (c OIDCClient) NewLogoutHandler() http.Handler {
+	baseURL, _ := url.Parse(c.baseURL)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessionCookie, err := r.Cookie(c.getCookieName())
+
+		if errors.Is(err, http.ErrNoCookie) {
+			http.Redirect(w, r, baseURL.Path, http.StatusFound)
+			return
+		}
+
+		sessionCookie.MaxAge = -1
+		http.SetCookie(w, sessionCookie)
+
+		if err != nil {
+			http.Error(w, "internal server error occured when reading session cookie", http.StatusInternalServerError)
+			return
+		}
+
+		userSessionClaims, err := ValidateUserToken(sessionCookie.Value, c.secret)
+		if err != nil {
+			http.Redirect(w, r, baseURL.Path, http.StatusFound)
+			return
+		}
+
+		redirect, err := rp.EndSession(context.Background(), c.client, userSessionClaims.IDTokenRaw, c.baseURL, "", "", nil)
+		if err != nil {
+			http.Redirect(w, r, baseURL.Path, http.StatusFound)
+			return
+		}
+
+		http.Redirect(w, r, redirect.String(), http.StatusFound)
+	})
+}
